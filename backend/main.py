@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import requests
 import json
@@ -13,11 +13,23 @@ from datetime import datetime, timedelta
 import re
 import logging
 import speech_recognition as sr
-import io
+from werkzeug.utils import secure_filename
+import uuid
+import datetime
+import secrets
+import os
 
 app = Flask(__name__)
 CORS(app) 
 
+# Configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Ensure upload directory exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -79,22 +91,103 @@ def init_db():
     # Events table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS events (
-            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
             date TEXT NOT NULL,
             place TEXT NOT NULL,
             image TEXT,
-            template TEXT,
+            admin_id INTEGER NOT NULL,
+            max_participants INTEGER DEFAULT 50,
+            current_participants INTEGER DEFAULT 0,
+            waste_collected REAL DEFAULT 0.0,
+            status TEXT DEFAULT 'upcoming',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (admin_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Event participants table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS event_participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (event_id) REFERENCES events (event_id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     
     conn.commit()
     conn.close()
 
-# Initialise database
-init_db()
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_db_connection():
+    conn = sqlite3.connect('users.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# LLM Integration
+def generate_event_with_llm(prompt):
+    try:
+        headers = {
+            'Content-Type': 'application/json',
+        }
+        
+        system_prompt = """You are an AI assistant that creates beach cleanup event templates. 
+        Based on the user's prompt, create a JSON response with the following structure:
+        {
+            "title": "Event title",
+            "description": "Detailed event description",
+            "place": "Location/beach name",
+            "date": "YYYY-MM-DD format",
+            "max_participants": number
+        }
+        
+        Make the events engaging, environmental-focused, and include details about what participants should bring, meeting points, and expected outcomes."""
+        
+        data = {
+            "model": "local-model",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+        
+        response = requests.post(CHAT_ENDPOINT, headers=headers, json=data, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            content = result['choices'][0]['message']['content']
+            
+            # Try to extract JSON from the response
+            try:
+                # Find JSON in the response
+                start_idx = content.find('{')
+                end_idx = content.rfind('}') + 1
+                json_str = content[start_idx:end_idx]
+                event_data = json.loads(json_str)
+                return event_data
+            except:
+                # Fallback if JSON parsing fails
+                return {
+                    "title": "Beach Cleanup Event",
+                    "description": content,
+                    "place": "Local Beach",
+                    "date": (datetime.datetime.now() + datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
+                    "max_participants": 50
+                }
+        else:
+            return None
+    except Exception as e:
+        print(f"LLM Error: {e}")
+        return None
 
 # Helper functions
 def hash_password(password):
@@ -155,6 +248,208 @@ def send_reset_email(email, token):
     except Exception as e:
         print(f"Email sending failed: {e}")
         return False
+
+
+# Admin Routes
+@app.route('/api/admin/dashboard', methods=['GET'])
+def admin_dashboard():
+    try:
+        conn = get_db_connection()
+        
+        # Total events
+        total_events = conn.execute('SELECT COUNT(*) as count FROM events').fetchone()['count']
+        
+        # Total participants
+        total_participants = conn.execute('SELECT COUNT(*) as count FROM event_participants').fetchone()['count']
+        
+        # Total waste collected
+        total_waste = conn.execute('SELECT SUM(waste_collected) as total FROM events').fetchone()['total'] or 0
+        
+        # Upcoming events
+        upcoming_events = conn.execute(
+            'SELECT COUNT(*) as count FROM events WHERE date >= date("now")'
+        ).fetchone()['count']
+        
+        # Recent events
+        recent_events = conn.execute('''
+            SELECT e.*, u.name as admin_name 
+            FROM events e 
+            JOIN users u ON e.admin_id = u.id 
+            ORDER BY e.created_at DESC 
+            LIMIT 5
+        ''').fetchall()
+        
+        conn.close()
+        
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'total_events': total_events,
+                'total_participants': total_participants,
+                'total_waste_collected': round(total_waste, 2),
+                'upcoming_events': upcoming_events,
+                'recent_events': [dict(row) for row in recent_events]
+            }
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/admin/events', methods=['GET'])
+def get_all_events():
+    try:
+        conn = get_db_connection()
+        events = conn.execute('''
+            SELECT e.*, u.name as admin_name 
+            FROM events e 
+            JOIN users u ON e.admin_id = u.id 
+            ORDER BY e.created_at DESC
+        ''').fetchall()
+        conn.close()
+        
+        return jsonify({
+            'status': 'success',
+            'events': [dict(row) for row in events]
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/admin/events/generate', methods=['POST'])
+def generate_event_admin():
+    try:
+        data = request.get_json()
+        prompt = data.get('prompt')
+        admin_id = data.get('admin_id', 1)  # Default admin ID
+        
+        if not prompt:
+            return jsonify({'status': 'error', 'message': 'Prompt is required'}), 400
+        
+        # Generate event using LLM
+        event_data = generate_event_with_llm(prompt)
+        
+        if not event_data:
+            return jsonify({'status': 'error', 'message': 'Failed to generate event'}), 500
+        
+        # Add additional fields
+        event_data['event_id'] = str(uuid.uuid4())
+        event_data['admin_id'] = admin_id
+        
+        return jsonify({
+            'status': 'success',
+            'event': event_data
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/admin/events', methods=['POST'])
+def create_event_admin():
+    try:
+        data = request.get_json()
+        
+        # Generate unique event ID
+        event_id = str(uuid.uuid4())
+        
+        conn = get_db_connection()
+        conn.execute('''
+            INSERT INTO events (event_id, title, description, date, place, admin_id, max_participants)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            event_id,
+            data['title'],
+            data.get('description', ''),
+            data['date'],
+            data['place'],
+            data.get('admin_id', 1),
+            data.get('max_participants', 50)
+        ))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Event created successfully',
+            'event_id': event_id
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/admin/events/<event_id>', methods=['PUT'])
+def update_event(event_id):
+    try:
+        data = request.get_json()
+        
+        conn = get_db_connection()
+        conn.execute('''
+            UPDATE events 
+            SET title = ?, description = ?, date = ?, place = ?, max_participants = ?
+            WHERE event_id = ?
+        ''', (
+            data['title'],
+            data.get('description', ''),
+            data['date'],
+            data['place'],
+            data.get('max_participants', 50),
+            event_id
+        ))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Event updated successfully'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/admin/events/<event_id>', methods=['DELETE'])
+def delete_event(event_id):
+    try:
+        conn = get_db_connection()
+        
+        # Delete event participants first
+        conn.execute('DELETE FROM event_participants WHERE event_id = ?', (event_id,))
+        
+        # Delete event
+        conn.execute('DELETE FROM events WHERE event_id = ?', (event_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Event deleted successfully'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'status': 'error', 'message': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'status': 'error', 'message': 'No file selected'}), 400
+        
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            # Add timestamp to avoid conflicts
+            filename = f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            
+            return jsonify({
+                'status': 'success',
+                'filename': filename,
+                'url': f'/uploads/{filename}'
+            })
+        else:
+            return jsonify({'status': 'error', 'message': 'Invalid file type'}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 # Routes
 @app.route('/generate-event-template', methods=['POST'])
@@ -658,4 +953,5 @@ def generate_quiz():
 if __name__ == '__main__':
     print("✅ Flask server running on http://localhost:5000")
     print("🔁 Ensure LM Studio is running at http://127.0.0.1:1234")
+    init_db()
     app.run(debug=True, host='0.0.0.0', port=5000)
